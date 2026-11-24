@@ -1546,7 +1546,9 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
-            Some(&Val::Missing(w)) => return Err(w),
+            Some(&Val::Missing(w)) => {
+                return Err(w);
+            }
             Some(&val) => return Ok(val),
             None => {}
         }
@@ -2382,14 +2384,16 @@ impl<'a> Lower<'a> {
                     .copied()
                     .unwrap_or("a lane mask from a carry")
             }),
-            Atom::Uniform(v) => match self.get(v)? {
-                Val::Bit(x) => Ok(x),
-                Val::I32(x) => {
-                    let z = self.s.m.i32(0);
-                    Ok(self.s.m.cmp(at, pred::NE, x, z))
+            Atom::Uniform(v) => {
+                match self.get(v)? {
+                    Val::Bit(x) => Ok(x),
+                    Val::I32(x) => {
+                        let z = self.s.m.i32(0);
+                        Ok(self.s.m.cmp(at, pred::NE, x, z))
+                    }
+                    Val::Missing(w) => Err(w),
                 }
-                Val::Missing(w) => Err(w),
-            },
+            }
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
                     return Ok(v);
@@ -3989,7 +3993,7 @@ impl<'a> Lower<'a> {
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
+        let (props, image, known_stride) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
                     0 => 1,
@@ -3999,7 +4003,7 @@ impl<'a> Lower<'a> {
                     5 => 7,
                     _ => return Err("an image dimension (cube or MSAA)"),
                 };
-                ((kind | u, 0x409), Some(kind))
+                ((kind | u, 0x409), Some(kind), 0u32)
             }
             Fields::Buffer { idxen, format, .. } => {
                 let stride = used.map_or(0, |u| u.stride);
@@ -4015,7 +4019,7 @@ impl<'a> Lower<'a> {
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                     return Err("a constant buffer's descriptor read as data");
                 }
-                (props, None)
+                (props, None, stride)
             }
             // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
             // at a uniform index): structured by the used-resource entry's
@@ -4082,9 +4086,26 @@ impl<'a> Lower<'a> {
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+                let mut w = vec![(1, d1), (2, d2), (3, d3), (4, depth)];
+                // Dword 0 is the GPU virtual base address – unrecoverable
+                // from DXIL intrinsics, but the heap-slot index is a
+                // non-zero proxy that keeps null-comparisons alive.
+                if let Ok(idx) = self.heap_index(site, first, false) {
+                    w.push((0, idx));
+                }
+                w
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let mut v = vec![(2, field(self, 0))];
+                // Dword 1 carries STRIDE[13:0] in bits [29:16].  For
+                // structured buffers props.1 IS the stride; for typed buffers
+                // the stride is tracked separately in known_stride.
+                let eff_stride = if props.0 & 0xFFF == 12 { props.1 } else { known_stride };
+                if eff_stride >= 4 && eff_stride.is_multiple_of(4) && eff_stride <= 0x3FFF {
+                    v.push((1, self.s.m.i32(eff_stride << 16)));
+                }
+                v
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -9791,6 +9812,40 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn a_structured_buffer_descriptor_dword_1_read_as_stride_lowers() {
+        // A structured buffer descriptor is loaded from the heap table, used for
+        // buffer_load, and then its dword 1 (BASE_ADDRESS[39:32] | STRIDE<<16) is
+        // also read back directly - the pattern that raised "a descriptor's address
+        // or format read as data" before the STRIDE field was reconstructed.
+        let words = [
+            0xBE82_0300,        // s_mov_b32 s2, s0
+            0xBE83_0380,        // s_mov_b32 s3, 0
+            0xF408_0201,
+            0xFA00_0000,        // s_load_dwordx4 s[8:11], s[2:3], null
+            0xE030_2000,
+            0x8002_0100,        // buffer_load_dword v1, v0, s[8:11], null idxen
+            0xD834_0000,
+            0x0000_0100,        // ds_write_b32 v0, v1
+            0xBF08_8009,        // s_cmp_gt_u32 s9, 0
+            0xBF85_0001,        // s_cbranch_scc1 +1
+            0xBE85_0380,        // s_mov_b32 s5, 0
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, layout, used).unwrap();
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
