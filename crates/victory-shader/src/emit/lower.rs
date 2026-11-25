@@ -4034,7 +4034,7 @@ impl<'a> Lower<'a> {
                     s if s.is_multiple_of(4) => (12 | u, s),
                     _ => return Err("a scalar-loaded buffer of odd stride read as data"),
                 };
-                (props, None)
+                (props, None, used.stride)
             }
             _ => return Err("a scalar memory read as data"),
         };
@@ -4088,11 +4088,11 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 let mut w = vec![(1, d1), (2, d2), (3, d3), (4, depth)];
                 // Dword 0 is the GPU virtual base address – unrecoverable
-                // from DXIL intrinsics, but the heap-slot index is a
-                // non-zero proxy that keeps null-comparisons alive.
-                if let Ok(idx) = self.heap_index(site, first, false) {
-                    w.push((0, idx));
-                }
+                // from DXIL intrinsics.  getDimensions() width is a faithful
+                // proxy: D3D12 null SRVs return 0 for all dimensions; every
+                // live descriptor has width ≥ 1 (D3D12 minimum), so null
+                // checks (`dword0 > 0`) branch correctly.
+                w.push((0, field(self, 0)));
                 w
             }
             None => {
@@ -10323,5 +10323,92 @@ mod tests {
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
         }
+    }
+
+    /// Image descriptor dword 0 read as data: `s_load_dwordx8` for a 2D SRV
+    /// followed by `image_load` and a null-texture check
+    /// (`v_cmp_gt_u32 vcc, s4, 0` → `s_cbranch_vccnz`) lowers without error.
+    ///
+    /// Before the fix, `descriptor_data()` left dword 0 as `Val::Missing(OTHER)`
+    /// (the GPU base address is unrecoverable from DXIL intrinsics), and the
+    /// branch on that VCC failed with "a descriptor's address or format read
+    /// as data".  The fix derives dword 0 from `getDimensions()` width:
+    /// D3D12 null SRVs return 0 for all dimensions, so the null check
+    /// (`dword_0 > 0`) is false for null/unbound slots and true for every
+    /// live descriptor (D3D12 minimum dimension is 1).  Full semantic
+    /// verification—both branches exercised with an actual live and a null
+    /// texture on the host GPU—is in
+    /// `diff_tests::image_descriptor_address_read_as_data_translates`.
+    #[test]
+    fn image_descriptor_dword0_width_proxy_null_check_lowers() {
+        let layout = vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        // s_mov_b32 s1, 0           – zero-extend heap base to 64 bits
+        // s_load_dwordx8 s[4:11]    – 2D SRV descriptor (8 dwords, slot 0)
+        // s_load_dwordx4 s[12:15]   – raw UAV descriptor (slot 1, offset 0x20)
+        // s_waitcnt lgkmcnt(0)
+        // image_load v[4:7],...     – usage site: marks s[4:11] as 2D SRV
+        // s_waitcnt vmcnt(0)
+        // v_mov_b32 v0, s4          – descriptor dword 0 (formerly Missing)
+        // v_mov_b32 v1, 0
+        // v_cmp_gt_u32 vcc_lo, v0, v1  – null check
+        // s_cbranch_vccnz +1        – the formerly failing branch instruction
+        // v_mov_b32 v8, 0
+        // buffer_store_dword v8, v0, s[12:15], 0
+        // s_endpgm
+        let words: &[u32] = &[
+            0xBE81_0380,              // s_mov_b32 s1, 0
+            0xF40C_0100, 0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], 0
+            0xF408_0300, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 0x20
+            0xBF8C_007F,              // s_waitcnt lgkmcnt(0)
+            0xF000_0F08, 0x0001_0402, // image_load v[4:7], v[2:3], s[4:11]
+            0xBF8C_3F70,              // s_waitcnt vmcnt(0)
+            0x7E00_0204,              // v_mov_b32 v0, s4
+            0x7E02_0280,              // v_mov_b32 v1, 0
+            0x7D88_0300,              // v_cmp_gt_u32 vcc_lo, v0, v1
+            0xBF87_0001,              // s_cbranch_vccnz +1
+            0x7E10_0280,              // v_mov_b32 v8, 0
+            0xE070_0000, 0x8003_0800, // buffer_store_dword v8, v0, s[12:15], 0
+            0xBF81_0000,              // s_endpgm
+        ];
+        let lowered = lower_with(words, layout, used)
+            .expect("image descriptor dword 0 as null-texture proxy should translate");
+        // The emitted output must be a valid DXBC container with a DXIL part.
+        let container = crate::Container::parse(&lowered.dxil)
+            .expect("emitted DXIL should be a valid DXBC container");
+        assert!(
+            container.part(crate::FourCC::DXIL).is_some(),
+            "emitted container should contain a DXIL part"
+        );
+        // The heap slot index is uniform (fixed table offset, no per-lane index).
+        assert_eq!(lowered.nonuniform_handles, 0, "descriptor access should be uniform");
     }
 }

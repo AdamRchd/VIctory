@@ -1551,7 +1551,9 @@ fn translated_compute_matches_pc() {
 /// `s_cbranch_vccnz`.  Before the fix in `descriptor_data()`, dword 0 (the
 /// GPU base address) was left as `Val::Missing`; the branch on that VCC then
 /// failed with "a descriptor's address or format read as data".  The fix
-/// synthesises a non-poison proxy via `heap_index`.
+/// derives dword 0 from `getDimensions()` width: 0 for null/unbound slots,
+/// ≥ 1 for every live descriptor (D3D12 minimum), so null checks branch
+/// correctly.
 #[test]
 fn image_descriptor_address_read_as_data_translates() {
     use crate::native::{
@@ -1617,8 +1619,8 @@ fn image_descriptor_address_read_as_data_translates() {
         // Wait for the vector memory result.
         0xBF8C_3F70, // s_waitcnt vmcnt(0)
         // v0 = image descriptor dword 0 (base address).
-        // After the fix, descriptor_data() synthesises the heap-slot index
-        // here instead of leaving it as Val::Missing(OTHER).
+        // After the fix, descriptor_data() derives this from getDimensions()
+        // width: 0 for null, ≥ 1 for live (not a fixed heap-slot index).
         0x7E00_0204, // v_mov_b32 v0, s4
         // v1 = 0 (the other side of the comparison).
         0x7E02_0280, // v_mov_b32 v1, 0
